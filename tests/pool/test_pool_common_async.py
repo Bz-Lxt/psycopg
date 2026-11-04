@@ -421,6 +421,258 @@ async def test_close_connection_on_pool_close(pool_cls, dsn):
     assert conn.closed
 
 
+async def test_close_default_is_immediate(pool_cls, dsn):
+    # The default close() doesn't wait for the connections in use.
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    await p.open()
+    conn = await p.getconn()
+    try:
+        t0 = time()
+        await p.close()
+        assert time() - t0 < 1.0
+        assert not conn.closed
+
+        # The connection is closed when eventually returned.
+        await p.putconn(conn)
+        assert conn.closed
+    except BaseException:
+        if not conn.closed:
+            await p.putconn(conn)
+        raise
+
+
+async def test_close_wait_no_connection_on_loan(pool_cls, dsn):
+    # Nothing on loan: close(wait=True) doesn't wait either.
+    p = pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=2, open=False)
+    await p.open()
+    await p.wait()
+    t0 = time()
+    await p.close(wait=True, timeout=5.0)
+    assert time() - t0 < 1.0
+
+
+async def test_close_wait_returns_connection(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    await p.open()
+    conn = await p.getconn()
+
+    async def close_wait():
+        await p.close(wait=True, timeout=5.0)
+
+    closer = spawn(close_wait)
+    await asleep(0.2)
+    assert p.closed
+    assert is_alive(closer)
+
+    await p.putconn(conn)
+    await gather(closer, timeout=5.0)
+    assert conn.closed
+    assert p._sched_runner is None
+    assert not p._workers
+
+
+@pytest.mark.timing
+async def test_close_wait_forces_after_timeout(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    await p.open()
+    workers = p._workers[:]
+    conn = await p.getconn()
+
+    t0 = time()
+    await p.close(wait=True, timeout=0.5)
+    elapsed = time() - t0
+    assert 0.4 < elapsed < 2.0
+
+    # The connection still on loan has been closed forcibly.
+    assert conn.closed
+    # The background tasks are gone.
+    assert p._sched_runner is None
+    assert not p._workers
+    for t in workers:
+        assert not is_alive(t)
+
+    # A late return of the forcibly-closed connection must be a no-op.
+    await p.putconn(conn)
+    assert conn.closed
+
+
+async def test_close_wait_rejects_new_getconn(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=1, open=False)
+    await p.open()
+    conn = await p.getconn()
+
+    async def close_wait():
+        await p.close(wait=True, timeout=5.0)
+
+    closer = spawn(close_wait)
+    await asleep(0.2)
+
+    with pytest.raises(pool.PoolClosed):
+        await p.getconn(timeout=1.0)
+
+    await p.putconn(conn)
+    await gather(closer, timeout=5.0)
+    assert conn.closed
+
+
+async def test_close_wait_fails_waiting_clients(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=1, open=False)
+    await p.open()
+    held = await p.getconn()
+    failed = AEvent()
+
+    async def waiter():
+        try:
+            await p.getconn(timeout=10.0)
+        except pool.PoolClosed:
+            failed.set()
+
+    async def close_wait():
+        await p.close(wait=True, timeout=5.0)
+
+    t = spawn(waiter)
+    await ensure_waiting(p)
+    closer = spawn(close_wait)
+
+    # The waiting client is notified promptly, even if a connection is on
+    # loan and the close is still waiting.
+    assert await failed.wait_timeout(2.0)
+
+    await p.putconn(held)
+    await gather(t, closer, timeout=5.0)
+    assert held.closed
+
+
+async def test_close_wait_concurrent_returns(pool_cls, dsn):
+    nconns = 3
+    p = pool_cls(dsn, min_size=min_size(pool_cls, nconns), max_size=nconns, open=False)
+    await p.open()
+    await p.wait()
+    conns = [await p.getconn() for _ in range(nconns)]
+
+    async def close_wait():
+        await p.close(wait=True, timeout=10.0)
+
+    async def give_back(conn, delay):
+        await asleep(delay)
+        await p.putconn(conn)
+
+    closer = spawn(close_wait)
+    await asleep(0.2)
+    returners = [
+        spawn(give_back, args=(conn, 0.1 * (i + 1))) for i, conn in enumerate(conns)
+    ]
+
+    await gather(closer, *returners, timeout=10.0)
+    assert p.closed
+    for conn in conns:
+        assert conn.closed
+    assert p._sched_runner is None
+    assert not p._workers
+
+
+async def test_close_wait_broken_connection(pool_cls, dsn):
+    # A connection found broken by the server while the pool is closing is
+    # still disposed of reliably.
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    await p.open()
+    conn = await p.getconn()
+    pid = conn.info.backend_pid
+
+    admin = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    try:
+        await admin.execute("select pg_terminate_backend(%s)", [pid])
+    finally:
+        await admin.close()
+
+    async def close_wait():
+        await p.close(wait=True, timeout=5.0)
+
+    closer = spawn(close_wait)
+    await asleep(0.2)
+    await p.putconn(conn)
+    await gather(closer, timeout=5.0)
+    assert conn.closed
+
+
+async def test_close_wait_with_reset(pool_cls, dsn):
+    async def reset(conn):
+        await asleep(0.3)
+
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, reset=reset, open=False)
+    await p.open()
+    conn = await p.getconn()
+
+    async def close_wait():
+        await p.close(wait=True, timeout=5.0)
+
+    closer = spawn(close_wait)
+    await asleep(0.1)
+    # Queues a ReturnConnection task, which must be processed before the
+    # workers stop instead of being dropped and leaking the connection.
+    await p.putconn(conn)
+    await gather(closer, timeout=5.0)
+    assert conn.closed
+    assert p._sched_runner is None
+
+
+async def test_close_wait_concurrent_close_calls(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    await p.open()
+    conn = await p.getconn()
+
+    async def close_wait():
+        await p.close(wait=True, timeout=5.0)
+
+    async def close_again():
+        await asleep(0.2)
+        # A concurrent close is a no-op and doesn't break the first one.
+        await p.close(wait=True, timeout=5.0)
+
+    async def give_back():
+        await asleep(0.4)
+        await p.putconn(conn)
+
+    c1 = spawn(close_wait)
+    c2 = spawn(close_again)
+    g = spawn(give_back)
+    await gather(c1, c2, g, timeout=6.0)
+    assert conn.closed
+
+    # Further close() calls on the closed pool are no-ops.
+    await p.close()
+    await p.close(wait=True, timeout=1.0)
+
+
+@skip_sync
+async def test_close_wait_cancelled(pool_cls, dsn):
+    from asyncio import CancelledError
+
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    await p.open()
+    workers = p._workers[:]
+    conn = await p.getconn()
+
+    async def close_wait():
+        await p.close(wait=True, timeout=10.0)
+
+    t = spawn(close_wait)
+    await asleep(0.2)
+    t.cancel()
+    with pytest.raises(CancelledError):
+        await t
+
+    # Even on cancellation nothing is left behind.
+    assert p.closed
+    assert conn.closed
+    for _ in range(50):
+        if p._sched_runner is None and not any(is_alive(w) for w in workers):
+            break
+        await asleep(0.05)
+    else:
+        pytest.fail("background tasks still running after cancellation")
+
+
 async def test_closed_queue(pool_cls, dsn):
     async def w1():
         async with p.connection() as conn:

@@ -18,6 +18,11 @@ psycopg_pool 3.3.4 (unreleased)
 - Fix the count of the connections in `NullConnectionPool` becoming negative
   after a failed `~NullConnectionPool.wait()`.
 - Don't grow the pool when calling `~ConnectionPool.check()` (:ticket:`#1434`).
+- Add `!wait` parameter to `~ConnectionPool.close()`: if `!True`, wait for the
+  connections currently in use to be returned before closing the pool, and
+  close forcibly the ones not returned within *timeout* seconds. This allows a
+  graceful shutdown of the service; the default behaviour of `!close()` is
+  unchanged.
 
 
 Current release

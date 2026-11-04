@@ -218,6 +218,11 @@ The `!ConnectionPool` class
 
    .. automethod:: close
 
+      .. versionchanged:: 3.3.4
+        Added the *wait* parameter to allow waiting for the connections in
+        use to be returned before closing the pool (graceful shutdown). See
+        :ref:`Shutting down the pool <pool-shutdown>`.
+
    .. note::
 
       The pool can be also used as a context manager, in which case it will
@@ -367,6 +372,11 @@ Only the functions and parameters with different signature from
 
    .. automethod:: open
    .. automethod:: close
+
+      .. versionchanged:: 3.3.4
+        Added the *wait* parameter to allow waiting for the connections in
+        use to be returned before closing the pool (graceful shutdown). See
+        :ref:`Shutting down the pool <pool-shutdown>`.
 
    .. note::
 

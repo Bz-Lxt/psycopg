@@ -409,6 +409,230 @@ def test_close_connection_on_pool_close(pool_cls, dsn):
     assert conn.closed
 
 
+def test_close_default_is_immediate(pool_cls, dsn):
+    # The default close() doesn't wait for the connections in use.
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    p.open()
+    conn = p.getconn()
+    try:
+        t0 = time()
+        p.close()
+        assert time() - t0 < 1.0
+        assert not conn.closed
+
+        # The connection is closed when eventually returned.
+        p.putconn(conn)
+        assert conn.closed
+    except BaseException:
+        if not conn.closed:
+            p.putconn(conn)
+        raise
+
+
+def test_close_wait_no_connection_on_loan(pool_cls, dsn):
+    # Nothing on loan: close(wait=True) doesn't wait either.
+    p = pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=2, open=False)
+    p.open()
+    p.wait()
+    t0 = time()
+    p.close(wait=True, timeout=5.0)
+    assert time() - t0 < 1.0
+
+
+def test_close_wait_returns_connection(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    p.open()
+    conn = p.getconn()
+
+    def close_wait():
+        p.close(wait=True, timeout=5.0)
+
+    closer = spawn(close_wait)
+    sleep(0.2)
+    assert p.closed
+    assert is_alive(closer)
+
+    p.putconn(conn)
+    gather(closer, timeout=5.0)
+    assert conn.closed
+    assert p._sched_runner is None
+    assert not p._workers
+
+
+@pytest.mark.timing
+def test_close_wait_forces_after_timeout(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    p.open()
+    workers = p._workers[:]
+    conn = p.getconn()
+
+    t0 = time()
+    p.close(wait=True, timeout=0.5)
+    elapsed = time() - t0
+    assert 0.4 < elapsed < 2.0
+
+    # The connection still on loan has been closed forcibly.
+    assert conn.closed
+    # The background tasks are gone.
+    assert p._sched_runner is None
+    assert not p._workers
+    for t in workers:
+        assert not is_alive(t)
+
+    # A late return of the forcibly-closed connection must be a no-op.
+    p.putconn(conn)
+    assert conn.closed
+
+
+def test_close_wait_rejects_new_getconn(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=1, open=False)
+    p.open()
+    conn = p.getconn()
+
+    def close_wait():
+        p.close(wait=True, timeout=5.0)
+
+    closer = spawn(close_wait)
+    sleep(0.2)
+
+    with pytest.raises(pool.PoolClosed):
+        p.getconn(timeout=1.0)
+
+    p.putconn(conn)
+    gather(closer, timeout=5.0)
+    assert conn.closed
+
+
+def test_close_wait_fails_waiting_clients(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=1, open=False)
+    p.open()
+    held = p.getconn()
+    failed = Event()
+
+    def waiter():
+        try:
+            p.getconn(timeout=10.0)
+        except pool.PoolClosed:
+            failed.set()
+
+    def close_wait():
+        p.close(wait=True, timeout=5.0)
+
+    t = spawn(waiter)
+    ensure_waiting(p)
+    closer = spawn(close_wait)
+
+    # The waiting client is notified promptly, even if a connection is on
+    # loan and the close is still waiting.
+    assert failed.wait(2.0)
+
+    p.putconn(held)
+    gather(t, closer, timeout=5.0)
+    assert held.closed
+
+
+def test_close_wait_concurrent_returns(pool_cls, dsn):
+    nconns = 3
+    p = pool_cls(dsn, min_size=min_size(pool_cls, nconns), max_size=nconns, open=False)
+    p.open()
+    p.wait()
+    conns = [p.getconn() for _ in range(nconns)]
+
+    def close_wait():
+        p.close(wait=True, timeout=10.0)
+
+    def give_back(conn, delay):
+        sleep(delay)
+        p.putconn(conn)
+
+    closer = spawn(close_wait)
+    sleep(0.2)
+    returners = [
+        spawn(give_back, args=(conn, 0.1 * (i + 1))) for i, conn in enumerate(conns)
+    ]
+
+    gather(closer, *returners, timeout=10.0)
+    assert p.closed
+    for conn in conns:
+        assert conn.closed
+    assert p._sched_runner is None
+    assert not p._workers
+
+
+def test_close_wait_broken_connection(pool_cls, dsn):
+    # A connection found broken by the server while the pool is closing is
+    # still disposed of reliably.
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    p.open()
+    conn = p.getconn()
+    pid = conn.info.backend_pid
+
+    admin = psycopg.Connection.connect(dsn, autocommit=True)
+    try:
+        admin.execute("select pg_terminate_backend(%s)", [pid])
+    finally:
+        admin.close()
+
+    def close_wait():
+        p.close(wait=True, timeout=5.0)
+
+    closer = spawn(close_wait)
+    sleep(0.2)
+    p.putconn(conn)
+    gather(closer, timeout=5.0)
+    assert conn.closed
+
+
+def test_close_wait_with_reset(pool_cls, dsn):
+
+    def reset(conn):
+        sleep(0.3)
+
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, reset=reset, open=False)
+    p.open()
+    conn = p.getconn()
+
+    def close_wait():
+        p.close(wait=True, timeout=5.0)
+
+    closer = spawn(close_wait)
+    sleep(0.1)
+    # Queues a ReturnConnection task, which must be processed before the
+    # workers stop instead of being dropped and leaking the connection.
+    p.putconn(conn)
+    gather(closer, timeout=5.0)
+    assert conn.closed
+    assert p._sched_runner is None
+
+
+def test_close_wait_concurrent_close_calls(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls), max_size=2, open=False)
+    p.open()
+    conn = p.getconn()
+
+    def close_wait():
+        p.close(wait=True, timeout=5.0)
+
+    def close_again():
+        sleep(0.2)
+        # A concurrent close is a no-op and doesn't break the first one.
+        p.close(wait=True, timeout=5.0)
+
+    def give_back():
+        sleep(0.4)
+        p.putconn(conn)
+
+    c1 = spawn(close_wait)
+    c2 = spawn(close_again)
+    g = spawn(give_back)
+    gather(c1, c2, g, timeout=6.0)
+    assert conn.closed
+
+    # Further close() calls on the closed pool are no-ops.
+    p.close()
+    p.close(wait=True, timeout=1.0)
+
+
 def test_closed_queue(pool_cls, dsn):
 
     def w1():

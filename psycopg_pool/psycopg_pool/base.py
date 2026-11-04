@@ -40,6 +40,9 @@ class BasePool:
 
     _pool: deque[Any]
 
+    # Connections currently checked out of the pool, in the hands of clients
+    _out: set[Any]
+
     def __init__(
         self,
         *,
@@ -76,8 +79,14 @@ class BasePool:
 
         self._nconns = min_size  # currently in the pool, out, being prepared
         self._pool = deque()
+        # Connections currently out of the pool and used by a client
+        self._out: set[Any] = set()
         self._stats = Counter[str]()
         self._drained_at = 0.0
+
+        # Event notified when all the connections on loan are returned.
+        # Set only while a close(wait=True) is in progress.
+        self._close_event: Any = None
 
         # Min number of connections in the pool in a max_idle unit of time.
         # It is reset periodically by the ShrinkPool scheduled task.

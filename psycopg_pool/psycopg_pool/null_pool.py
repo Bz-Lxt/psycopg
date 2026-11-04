@@ -17,7 +17,7 @@ from psycopg.pq import TransactionStatus
 
 from .abc import CT, ConnectFailedCB, ConnectionCB, ConninfoParam, KwargsParam
 from .pool import AddConnection, ConnectionPool
-from .errors import PoolTimeout, TooManyRequests
+from .errors import PoolClosed, PoolTimeout, TooManyRequests
 from ._compat import ConnectionTimeout
 from ._acompat import Event
 from .base_null_pool import _BaseNullConnectionPool
@@ -109,6 +109,10 @@ class NullConnectionPool(_BaseNullConnectionPool, ConnectionPool[CT]):
         if timeout is not None and timeout <= 0.0:
             raise PoolTimeout()
 
+        if self._closed:
+            # The pool is closing: don't create a new connection
+            raise PoolClosed(f"the pool {self.name!r} is closed")
+
         conn: CT | None = None
         if self.max_size == 0 or self._nconns < self.max_size:
             # Create a new connection for the client
@@ -117,6 +121,7 @@ class NullConnectionPool(_BaseNullConnectionPool, ConnectionPool[CT]):
             except ConnectionTimeout as ex:
                 raise PoolTimeout(str(ex)) from None
             self._nconns += 1
+            self._out.add(conn)
         elif self.max_waiting and len(self._waiting) >= self.max_waiting:
             self._stats[self._REQUESTS_ERRORS] += 1
             raise TooManyRequests(
@@ -125,20 +130,20 @@ class NullConnectionPool(_BaseNullConnectionPool, ConnectionPool[CT]):
             )
         return conn
 
-    def _maybe_close_connection(self, conn: CT) -> bool:
-        # Close the connection if no client is waiting for it, or if the pool
-        # is closed. For extra refcare remove the pool reference from it.
-        # Maintain the stats.
+    def _close_returned_connection(self, conn: CT) -> None:
+        # The pool doesn't keep idle connections: a returned connection must
+        # be closed. For extra refcare remove the pool reference from it.
+        # Maintain the stats and the count of the connections outstanding.
         with self._lock:
-            if not self._closed and self._waiting:
-                return False
-
-            conn._pool = None
             if conn.pgconn.transaction_status == TransactionStatus.UNKNOWN:
                 self._stats[self._RETURNS_BAD] += 1
-            self._close_connection(conn)
             self._nconns -= 1
-            return True
+        self._close_connection(conn)
+
+    def _close_on_return(self) -> bool:
+        # Close the returned connection unless a client is already waiting
+        # to take it: the pool doesn't keep idle connections.
+        return self._closed or not self._waiting
 
     def resize(self, min_size: int, max_size: int | None = None) -> None:
         """Change the size of the pool during runtime.
@@ -171,6 +176,8 @@ class NullConnectionPool(_BaseNullConnectionPool, ConnectionPool[CT]):
                 # If there is a client waiting (which is still waiting and
                 # hasn't timed out), give it the connection and notify it.
                 if self._waiting.popleft().set(conn):
+                    # The connection passes into the client's hands
+                    self._out.add(conn)
                     break
             else:
                 # No client waiting for a connection: close the connection

@@ -45,6 +45,7 @@ logger = logging.getLogger("psycopg.pool")
 
 class AsyncConnectionPool(Generic[ACT], BasePool):
     _pool: deque[ACT]
+    _out: set[ACT]
 
     def __init__(
         self,
@@ -308,7 +309,23 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
                 conn = await pos.wait(timeout=timeout)
             except CLIENT_EXCEPTIONS:
                 if pos.conn:
-                    self.run_task(ReturnConnection(self, pos.conn, from_getconn=True))
+                    # The connection was assigned to the client but the wait
+                    # was interrupted (for instance by a timeout or a cancel):
+                    # return it to the pool. Do it atomically with the update
+                    # of the set of the connections out, so that, if the pool
+                    # is closing, the connection cannot be lost in a task
+                    # queued after the workers' termination.
+                    async with self._lock:
+                        self._discard_from_out(pos.conn)
+                        if self._closed:
+                            close_conn = True
+                        else:
+                            close_conn = False
+                            self.run_task(
+                                ReturnConnection(self, pos.conn, from_getconn=True)
+                            )
+                    if close_conn:
+                        await self._close_returned_connection(pos.conn)
                 self._stats[self._REQUESTS_ERRORS] += 1
                 raise
             finally:
@@ -330,8 +347,12 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
         if self._pool:
             # Take a connection ready out of the pool
             conn = self._pool.popleft()
+            self._out.add(conn)
             if len(self._pool) < self._nconns_min:
                 self._nconns_min = len(self._pool)
+        elif self._closed:
+            # The pool is closing: don't accept new clients in the queue
+            raise PoolClosed(f"the pool {self.name!r} is closed")
         elif self.max_waiting and len(self._waiting) >= self.max_waiting:
             self._stats[self._REQUESTS_ERRORS] += 1
             raise TooManyRequests(
@@ -369,10 +390,27 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
         self._check_pool_putconn(conn)
 
         logger.info("returning connection to %r", self.name)
-        if await self._maybe_close_connection(conn):
+
+        # The connection is no more out of the pool; do it under lock so
+        # that a close(wait=True) in progress is notified atomically.
+        async with self._lock:
+            self._discard_from_out(conn)
+            close_on_return = self._close_on_return()
+
+        if close_on_return:
+            # If the pool is closed (or doesn't keep idle connections), just
+            # close the connection instead of returning it to the pool.
+            await self._close_returned_connection(conn)
             return
 
         await self._putconn(conn, from_getconn=False)
+
+    def _close_on_return(self) -> bool:
+        """Return `!True if a returned connection must be disposed of.
+
+        Must be called while holding `self._lock`.
+        """
+        return self._closed
 
     async def drain(self) -> None:
         """
@@ -395,24 +433,51 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
             self.run_task(AddConnection(self))
 
     async def _putconn(self, conn: ACT, from_getconn: bool) -> None:
-        # Use a worker to perform eventual maintenance work in a separate task
+        # Use a worker to perform eventual maintenance work in a separate
+        # task. The update of the connections out and the enqueue of the task
+        # must happen atomically, otherwise a close(wait=True) in progress
+        # might stop the workers before the task is queued, leaking the conn.
         if self._reset:
-            self.run_task(ReturnConnection(self, conn, from_getconn=from_getconn))
+            async with self._lock:
+                self._discard_from_out(conn)
+                if self._closed:
+                    enqueue = False
+                else:
+                    self.run_task(
+                        ReturnConnection(self, conn, from_getconn=from_getconn)
+                    )
+                    enqueue = True
+            if not enqueue:
+                await self._close_returned_connection(conn)
         else:
+            async with self._lock:
+                self._discard_from_out(conn)
             await self._return_connection(conn, from_getconn=from_getconn)
 
-    async def _maybe_close_connection(self, conn: ACT) -> bool:
-        """Close a returned connection if necessary.
+    async def _close_returned_connection(self, conn: ACT) -> None:
+        """Close a connection returned to a pool that is closing.
 
-        Return `!True if the connection was closed.
+        Unlike a connection in regular use, it must just be disposed of.
         """
-        # If the pool is closed just close the connection instead of returning
-        # it to the pool. For extra refcare remove the pool reference from it.
-        if not self._closed:
-            return False
-
         await self._close_connection(conn)
-        return True
+
+    async def _force_close_connection(self, conn: ACT) -> None:
+        """Close a connection that is still on loan when shutdown can't wait.
+
+        Unlike `_close_connection`, don't remove the pool reference from the
+        connection: if the client holding it eventually calls `putconn()`, the
+        pool must still recognize it and dispose of it quietly.
+        """
+        await conn.close()
+
+    def _discard_from_out(self, conn: ACT) -> None:
+        """Mark a connection as no more on loan.
+
+        Must be called while holding `self._lock`.
+        """
+        self._out.discard(conn)
+        if self._close_event and not self._out:
+            self._close_event.set()
 
     async def open(self, wait: bool = False, timeout: float = 30.0) -> None:
         """Open the pool by starting connecting and and accepting clients.
@@ -494,16 +559,28 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
         # remained unused.
         self.run_task(Schedule(self, ShrinkPool(self), self.max_idle))
 
-    async def close(self, timeout: float = 5.0) -> None:
+    async def close(self, timeout: float = 5.0, *, wait: bool = False) -> None:
         """Close the pool and make it unavailable to new clients.
 
         All the waiting and future clients will fail to acquire a connection
-        with a `PoolClosed` exception. Currently used connections will not be
-        closed until returned to the pool.
+        with a `PoolClosed` exception.
 
-        Wait *timeout* seconds for threads to terminate their job, if positive.
-        If the timeout expires the pool is closed anyway, although it may raise
-        some warnings on exit.
+        If *wait* is `!False` (the default), return immediately: connections
+        currently in use will not be closed until returned to the pool. This is
+        the historical behaviour of `!close()`.
+
+        If *wait* is `!True`, before tearing down the pool, wait up to
+        *timeout* seconds for the connections currently on loan to be returned
+        by their clients. If the timeout expires, the connections not returned
+        yet are closed forcibly: the code still using them will find the
+        connection closed.
+
+        In both cases, wait *timeout* seconds for the background tasks to
+        terminate too. If the timeout expires the pool is closed anyway,
+        although it may raise some warnings on exit.
+
+        The method is idempotent: calling it on an already closed pool is a
+        no-op, even if another close is in progress.
         """
         if self._closed:
             return
@@ -518,22 +595,63 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
             connections = list(self._pool)
             self._pool.clear()
 
-            # Take the workers out of the pool. Will stop them outside the lock
-            workers = await self._signal_stop_worker()
+            # Event that will be set when every connection on loan is back.
+            close_event: AEvent | None = None
+            if wait and self._out:
+                close_event = self._close_event = AEvent()
 
         # Now that the flag _closed is set, getconn will fail immediately,
         # putconn will just close the returned connection.
 
-        # Wait for the worker tasks to terminate
-        await agather(*workers, timeout=timeout)
-
-        # Close the connections that were still in the pool
-        for conn in connections:
-            await self._close_connection(conn)
-
         # Signal to eventual clients in the queue that business is closed.
         for pos in waiting:
             await pos.fail(PoolClosed(f"the pool {self.name!r} is closed"))
+
+        try:
+            if close_event is not None:
+                # Wait for the connections currently in use to be returned.
+                await close_event.wait_timeout(timeout)
+        finally:
+            # Run the rest of the shutdown even if close() has been
+            # cancelled, in order not to leave connections or tasks behind.
+
+            # Close the connections still on loan after the timeout.
+            if close_event is not None:
+                async with self._lock:
+                    leftovers = list(self._out)
+                    self._out.clear()
+                    self._close_event = None
+
+                for conn in leftovers:
+                    try:
+                        await self._force_close_connection(conn)
+                    except CLIENT_EXCEPTIONS as ex:
+                        logger.warning(
+                            "error forcibly closing connection: %s: %s",
+                            ex.__class__.__name__,
+                            ex,
+                        )
+
+            # Take the workers out of the pool. Will stop them outside the
+            # lock. If close() was cancelled don't let a failure here prevent
+            # the rest of the shutdown.
+            try:
+                async with self._lock:
+                    workers = await self._signal_stop_worker()
+                # Wait for the worker tasks to terminate
+                await agather(*workers, timeout=timeout)
+            except CLIENT_EXCEPTIONS as ex:
+                logger.debug(
+                    "error stopping the workers of %r: %s: %s",
+                    self.name,
+                    ex.__class__.__name__,
+                    ex,
+                )
+
+            # Close the connections that were still in the pool
+            for conn in connections:
+                with suppress(CLIENT_EXCEPTIONS):
+                    await self._close_connection(conn)
 
     async def _signal_stop_worker(self) -> list[AWorker]:
         # Stop the scheduler
@@ -861,6 +979,8 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
                 # hasn't timed out), give it the connection and notify it.
 
                 if await self._waiting.popleft().set(conn):
+                    # The connection passes from the pool into the client's hands
+                    self._out.add(conn)
                     break
             else:
                 # No client waiting for a connection: put it back into the pool
@@ -1032,12 +1152,17 @@ class MaintenanceTask(ABC):
         """
         pool = self.pool()
         if not pool or pool.closed:
-            # Pool is no more working. Quietly discard the operation.
+            # Pool is no more working. Quietly discard the operation, but
+            # give the task a chance to dispose of its resources.
             logger.debug("task run discarded: %s", self)
+            await self._discard(pool)
             return
 
         logger.debug("task running in %s: %s", current_task_name(), self)
         await self._run(pool)
+
+    async def _discard(self, pool: AsyncConnectionPool[Any] | None) -> None:
+        """Dispose of resources held by a task dropped because pool is closing."""
 
     async def tick(self) -> None:
         """Run the scheduled task
@@ -1089,6 +1214,16 @@ class ReturnConnection(MaintenanceTask):
 
     async def _run(self, pool: AsyncConnectionPool[Any]) -> None:
         await pool._return_connection(self.conn, from_getconn=self.from_getconn)
+
+    async def _discard(self, pool: AsyncConnectionPool[Any] | None) -> None:
+        # The pool is closing: instead of dropping the task and leaking the
+        # connection, close it. If the pool is gone just close the connection.
+        if pool is not None:
+            await pool._close_returned_connection(self.conn)
+        else:
+            self.conn._pool = None
+            with suppress(CLIENT_EXCEPTIONS):
+                await self.conn.close()
 
 
 class ShrinkPool(MaintenanceTask):

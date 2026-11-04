@@ -194,6 +194,58 @@ can use a `lifespan`__ function::
     pool.open()` or `async with ... as pool` explicitly.
 
 
+.. _pool-shutdown:
+
+Shutting down the pool
+----------------------
+
+By default, `~ConnectionPool.close()` closes the pool *immediately*: it stops
+accepting new requests, terminates the background tasks, and closes the
+connections currently idle in the pool. Connections currently handed out to
+the clients are not closed: they will be closed when they are eventually
+returned to the pool (which, by then, will only dispose of them).
+
+If you are stopping a service and want to make sure that the operations in
+progress are completed, you can call `!close()` passing `!wait=True`::
+
+    pool.close(wait=True)           # sync
+    await pool.close(wait=True)     # async
+
+In this mode, the pool will stop accepting new requests (which will fail with
+`PoolClosed`) but will wait up to *timeout* seconds (5 by default) for the
+connections currently in use to be returned by their clients. Once every
+connection is back, the pool is closed normally.
+
+If the timeout expires and some connections are still with the clients, they
+are closed forcibly: the code still using them will find the connection
+closed. Note that, in this case, the transactions opened on such connections
+will be aborted by the server.
+
+This behaviour is useful in combination with the shutdown hooks provided by
+your application framework, where usually a grace period is allowed for
+in-flight requests to complete. For example, with FastAPI::
+
+    @asynccontextmanager
+    async def lifespan(instance: FastAPI):
+        await pool.open()
+        yield
+        # Give the requests in progress up to 10 seconds to complete...
+        await pool.close(wait=True, timeout=10)
+        # ...then close the connections not returned yet.
+
+    app = FastAPI(lifespan=lifespan)
+
+`!NullConnectionPool` supports the same behaviour: as it doesn't keep idle
+connections, `!close(wait=True)` only waits for the connections currently
+handed out and closes them as they are returned.
+
+Calling `!close()` repeatedly (including while a `!close(wait=True)` is in
+progress, or from concurrent tasks or threads) is safe: only the first call
+runs the shutdown, the following ones are no-ops. If `!close()` is cancelled
+while waiting (only possible with `AsyncConnectionPool`), the shutdown still
+completes, so that no connections or background tasks are left behind.
+
+
 .. _null-pool:
 
 Null connection pools
