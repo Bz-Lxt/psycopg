@@ -5,6 +5,7 @@ import pytest
 
 import psycopg
 from psycopg.conninfo import conninfo_attempts, conninfo_to_dict
+from psycopg._connect_race import _race_waves
 
 pytestmark = pytest.mark.anyio
 
@@ -196,3 +197,29 @@ def test_conninfo_random_multi_ips(fake_resolve):
     args["load_balance_hosts"] = "random"
     hostaddrs = [str(att["hostaddr"]) for att in conninfo_attempts(args)]
     assert hostaddrs != sorted(hostaddrs)
+
+
+def test_race_waves_single(fake_resolve):
+    params = conninfo_to_dict("host=1.1.1.1,2.2.2.2")
+    attempts = conninfo_attempts(params)
+    assert _race_waves(attempts, params) == [attempts]
+
+
+@pytest.mark.libpq(">= 14")
+def test_race_waves_prefer_standby(fake_resolve):
+    params = conninfo_to_dict(
+        "host=1.1.1.1,2.2.2.2 target_session_attrs=prefer-standby"
+    )
+    attempts = conninfo_attempts(params)
+    waves = _race_waves(attempts, params)
+
+    # Standby attempts race first; attempts accepting any server race only
+    # if no standby is available.
+    assert len(waves) == 2
+    standbys, primaries = waves
+    assert len(standbys) == len(primaries) == 2
+    assert all((att["target_session_attrs"] == "standby" for att in standbys))
+    assert all(("target_session_attrs" not in att for att in primaries))
+    assert [att["hostaddr"] for att in standbys] == [
+        att["hostaddr"] for att in primaries
+    ]

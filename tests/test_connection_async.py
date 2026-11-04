@@ -165,6 +165,164 @@ async def test_multi_hosts_timeout(aconn_cls, proxy, dsn):
             assert conn.info.host == proxy.server_host
 
 
+async def test_parallel_connect(aconn_cls, dsn):
+    conn = await aconn_cls.connect(dsn, parallel=True)
+    try:
+        assert not conn.closed
+        assert conn.pgconn.status == pq.ConnStatus.OK
+    finally:
+        await conn.close()
+
+
+@pytest.mark.slow
+@pytest.mark.timing
+async def test_multi_hosts_parallel(aconn_cls, proxy, dsn):
+    # The first endpoint is deaf: racing the attempts allows the reachable
+    # endpoint to win without waiting for the deaf attempt to time out.
+    args = conninfo_to_dict(dsn)
+    args["host"] = f"{proxy.client_host},{proxy.server_host}"
+    args["port"] = f"{proxy.client_port},{proxy.server_port}"
+    args.pop("hostaddr", None)
+    args["connect_timeout"] = "2"
+    with proxy.deaf_listen():
+        t0 = time.time()
+        async with await aconn_cls.connect(**args, parallel=True) as conn:
+            elapsed = time.time() - t0
+            assert elapsed < 1.0
+            assert conn.info.port == int(proxy.server_port)
+            assert conn.info.host == proxy.server_host
+
+
+@pytest.mark.slow
+@pytest.mark.timing
+async def test_multi_hosts_parallel_timeout(aconn_cls):
+    args = {
+        # IPv4 address blocks reserved for documentation.
+        # https://datatracker.ietf.org/doc/rfc5737/
+        "host": "192.0.2.1,198.51.100.1",
+        "port": "1234,5678",
+    }
+    t0 = time.time()
+    with pytest.raises(psycopg.OperationalError) as e:
+        await aconn_cls.connect(**args, connect_timeout=2, parallel=True)
+    elapsed = time.time() - t0
+
+    # The timeout bounds the whole race, not each attempt.
+    assert elapsed == pytest.approx(2.0, abs=0.3)
+
+    msg = str(e.value)
+    assert MULTI_FAILURE_MESSAGE in msg
+    lines = [line for line in msg.splitlines() if line.startswith("- ")]
+    assert len(lines) == 2
+    # The errors are reported in the attempts order, not completion order.
+    assert "192.0.2.1" in lines[0]
+    assert "198.51.100.1" in lines[1]
+    assert all("connection timeout expired" in line for line in lines)
+
+
+@pytest.mark.slow
+@pytest.mark.timing
+@pytest.mark.skipif(pq.__impl__ != "python", reason="can't monkeypatch C module")
+async def test_multi_hosts_parallel_release_losers(aconn_cls, proxy, dsn, monkeypatch):
+    args = conninfo_to_dict(dsn)
+    args["host"] = f"{proxy.client_host},{proxy.server_host}"
+    args["port"] = f"{proxy.client_port},{proxy.server_port}"
+    args.pop("hostaddr", None)
+    args["connect_timeout"] = "2"
+
+    started = []
+    finished = []
+    orig_connect_start = pq.PGconn.connect_start
+    orig_finish = pq.PGconn.finish
+
+    def spy_connect_start(conninfo):
+        pgconn = orig_connect_start(conninfo)
+        started.append(pgconn)
+        return pgconn
+
+    def spy_finish(self):
+        finished.append(self)
+        return orig_finish(self)
+
+    monkeypatch.setattr(pq.PGconn, "connect_start", spy_connect_start)
+    monkeypatch.setattr(pq.PGconn, "finish", spy_finish)
+
+    with proxy.deaf_listen():
+        conn = await aconn_cls.connect(**args, parallel=True)
+    try:
+        assert len(started) == 2
+        # The losing attempt is released as soon as the winner is known.
+        assert started[0] in finished
+        # The winning connection is still open.
+        assert started[1] not in finished
+    finally:
+        await conn.close()
+    assert started[1] in finished
+
+
+@pytest.mark.anyio
+@pytest.mark.slow
+@pytest.mark.timing
+@pytest.mark.skipif(pq.__impl__ != "python", reason="can't monkeypatch C module")
+async def test_multi_hosts_parallel_interrupt(monkeypatch):
+    args = {
+        # IPv4 address blocks reserved for documentation.
+        # https://datatracker.ietf.org/doc/rfc5737/
+        "host": "192.0.2.1,198.51.100.1",
+        "port": "1234,5678",
+        "connect_timeout": "10",
+    }
+
+    started = []
+    finished = []
+    orig_connect_start = pq.PGconn.connect_start
+    orig_finish = pq.PGconn.finish
+
+    def spy_connect_start(conninfo):
+        pgconn = orig_connect_start(conninfo)
+        started.append(pgconn)
+        return pgconn
+
+    def spy_finish(self):
+        finished.append(self)
+        return orig_finish(self)
+
+    monkeypatch.setattr(pq.PGconn, "connect_start", spy_connect_start)
+    monkeypatch.setattr(pq.PGconn, "finish", spy_finish)
+
+    aconn_cls = psycopg.AsyncConnection
+    t0 = time.time()
+    if True:  # ASYNC
+        import asyncio
+
+        task = asyncio.ensure_future(aconn_cls.connect(**args, parallel=True))
+        await asleep(0.5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        import signal
+
+        aconn_cls = psycopg.Connection
+        handler = signal.signal(signal.SIGALRM, signal.default_int_handler)
+        signal.setitimer(signal.ITIMER_REAL, 0.5)
+        try:
+            # Raise KeyboardInterrupt while the attempts are in flight, as
+            # Ctrl-C would.
+            with pytest.raises(KeyboardInterrupt):
+                await aconn_cls.connect(**args, parallel=True)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, handler)
+    elapsed = time.time() - t0
+
+    # The interruption doesn't wait for the connect timeout.
+    assert elapsed < 2.0
+    assert len(started) == 2
+    # Every in-flight connection is released promptly.
+    assert all(pgconn in finished for pgconn in started)
+
+
 async def test_close(aconn):
     assert not aconn.closed
     assert not aconn.broken

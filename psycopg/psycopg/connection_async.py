@@ -39,6 +39,10 @@ if True:  # ASYNC
     import sys
     import asyncio
 
+    from ._connect_race import race_connect_async
+else:
+    from ._connect_race import race_connect
+
 if TYPE_CHECKING:
     from .pq.abc import PGconn
 
@@ -92,10 +96,20 @@ class AsyncConnection(BaseConnection[Row]):
         context: AdaptContext | None = None,
         row_factory: AsyncRowFactory[Row] | None = None,
         cursor_factory: type[AsyncCursor[Row]] | None = None,
+        parallel: bool = False,
         **kwargs: ConnParam,
     ) -> Self:
         """
         Connect to a database server and return a new `AsyncConnection` instance.
+
+        :param parallel: if more than one connection endpoint is specified,
+            start the attempts concurrently instead of serially and return the
+            first connection that succeeds (respecting a possible
+            `target_session_attrs=prefer-standby` preference). All the
+            attempts share the same `connect_timeout`; connections that lose
+            the race, or are still open when the timeout expires or the
+            operation is interrupted, are closed immediately. By default, the
+            endpoints are tried one after the other.
         """
         if True:  # ASYNC
             if sys.platform == "win32":
@@ -115,28 +129,50 @@ class AsyncConnection(BaseConnection[Row]):
         rv = None
         attempts = await conninfo_attempts_async(params)
         conn_errors: list[tuple[e.Error, str]] = []
-        for attempt in attempts:
-            tdescr = (attempt.get("host"), attempt.get("port"), attempt.get("hostaddr"))
-            descr = "host: %r, port: %r, hostaddr: %r" % tdescr
-            logger.debug("connection attempt: %s", descr)
-            try:
-                conninfo = make_conninfo("", **attempt)
-                gen = cls._connect_gen(conninfo)
-                rv = await waiting.wait_conn_async(
-                    gen, interval=_WAIT_INTERVAL, timeout=timeout
+        if parallel:
+            if True:  # ASYNC:
+                rv, conn_errors = await race_connect_async(
+                    cls,
+                    attempts,
+                    params,
+                    timeout=timeout,
+                    interval=_WAIT_INTERVAL,
                 )
-            except e._WaitTimeout:
-                tex = e.ConnectionTimeout("connection timeout expired")
-                logger.debug("connection failed: %s: %s", descr, str(tex))
-                conn_errors.append((tex, descr))
-            except e.Error as ex:
-                logger.debug("connection failed: %s: %s", descr, str(ex))
-                conn_errors.append((ex, descr))
-            except e._NO_TRACEBACK as ex:
-                raise ex.with_traceback(None)
             else:
-                logger.debug("connection succeeded: %s", descr)
-                break
+                rv, conn_errors = race_connect(
+                    cls,
+                    attempts,
+                    params,
+                    timeout=timeout,
+                    interval=_WAIT_INTERVAL,
+                )
+        else:
+            for attempt in attempts:
+                tdescr = (
+                    attempt.get("host"),
+                    attempt.get("port"),
+                    attempt.get("hostaddr"),
+                )
+                descr = "host: %r, port: %r, hostaddr: %r" % tdescr
+                logger.debug("connection attempt: %s", descr)
+                try:
+                    conninfo = make_conninfo("", **attempt)
+                    gen = cls._connect_gen(conninfo)
+                    rv = await waiting.wait_conn_async(
+                        gen, interval=_WAIT_INTERVAL, timeout=timeout
+                    )
+                except e._WaitTimeout:
+                    tex = e.ConnectionTimeout("connection timeout expired")
+                    logger.debug("connection failed: %s: %s", descr, str(tex))
+                    conn_errors.append((tex, descr))
+                except e.Error as ex:
+                    logger.debug("connection failed: %s: %s", descr, str(ex))
+                    conn_errors.append((ex, descr))
+                except e._NO_TRACEBACK as ex:
+                    raise ex.with_traceback(None)
+                else:
+                    logger.debug("connection succeeded: %s", descr)
+                    break
 
         if not rv:
             last_ex = conn_errors[-1][0]

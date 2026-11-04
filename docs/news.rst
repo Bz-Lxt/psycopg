@@ -13,6 +13,13 @@ Future releases
 Psycopg 3.3.7 (unreleased)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+- Add a *parallel* option to `Connection.connect()` and
+  `AsyncConnection.connect()` to start the connection attempts to several
+  endpoints concurrently, sharing a single timeout, and to return the first
+  connection that succeeds (respecting the
+  :pq:`target_session_attrs` preference); losing connections are closed as
+  soon as the race ends, also on timeout or interruption. By default, the
+  endpoints are still tried serially.
 - Fix segfault fetching arrays of strings or timestamps after closing the
   connection (:ticket:`#1428`).
 

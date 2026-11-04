@@ -71,6 +71,22 @@ def _connect(conninfo: str) -> PQGenConn[PGconn]:
 
     conn = pq.PGconn.connect_start(conninfo.encode())
     logger.debug("connection started: %s", conn)
+    return (yield from _connect_poll(conn, conninfo))
+
+
+def _connect_poll(conn: PGconn, conninfo: str) -> PQGenConn[PGconn]:
+    """
+    Drive to completion a connection already started using
+    `!PQconn.connect_start()`.
+
+    Yield ``(socket, wait)`` pairs, like `_connect()`, and return the input
+    `!PGconn` on completion.
+
+    The generator doesn't own the connection: the caller is responsible for
+    finishing it if the attempt is abandoned (for instance because it lost a
+    race against concurrent attempts); this allows to run several connection
+    attempts concurrently.
+    """
     while True:
         if conn.status == BAD:
             encoding = conninfo_encoding(conninfo)
